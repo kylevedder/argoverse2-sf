@@ -1,0 +1,5 @@
+/.python-version
+/__pycache__/
+/preds/
+/test/
+/*.parquet
