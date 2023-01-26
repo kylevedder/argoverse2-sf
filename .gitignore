@@ -3,3 +3,5 @@
 /preds/
 /test/
 /*.parquet
+.vscode/
+docker_history.txt

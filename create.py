@@ -1,3 +1,5 @@
+import os
+os.environ["OMP_NUM_THREADS"] = "1"
 from av2.datasets.sensor.av2_sensor_dataloader import AV2SensorDataLoader
 from av2.structures.sweep import Sweep
 from av2.structures.cuboid import CuboidList, Cuboid
@@ -6,6 +8,7 @@ from av2.map.map_api import ArgoverseStaticMap
 from av2.geometry.se3 import SE3
 
 import os
+import multiprocessing
 from argparse import ArgumentParser
 from pathlib import Path
 from multiprocessing import Pool, current_process
@@ -75,10 +78,17 @@ def compute_sceneflow(dataset: AV2SensorDataLoader, log_id: str,
     """
     def compute_flow(sweeps, cuboids, poses):
         ego1_SE3_ego0 = poses[1].inverse().compose(poses[0])
+        # Convert to float32s
+        ego1_SE3_ego0.rotation = ego1_SE3_ego0.rotation.astype(np.float32)
+        ego1_SE3_ego0.translation = ego1_SE3_ego0.translation.astype(np.float32)
         
         flow = ego1_SE3_ego0.transform_point_cloud(sweeps[0].xyz) -  sweeps[0].xyz
-        valid = np.ones(len(sweeps[0].xyz))
-        classes = -np.ones(len(sweeps[0].xyz))
+        # Convert to float32s
+        flow = flow.astype(np.float32)
+        
+        valid = np.ones(len(sweeps[0].xyz), dtype=np.bool_)
+        classes = -np.ones(len(sweeps[0].xyz), dtype=np.int8)
+        
         
         for id in cuboids[0]:
             c0 = cuboids[0][id]
@@ -91,7 +101,7 @@ def compute_sceneflow(dataset: AV2SensorDataLoader, log_id: str,
                 c1 = cuboids[1][id]
                 c1_SE3_c0 = c1.dst_SE3_object.compose(c0.dst_SE3_object.inverse())
                 obj_flow = c1_SE3_c0.transform_point_cloud(obj_pts) - obj_pts
-                flow[obj_mask] = obj_flow
+                flow[obj_mask] = obj_flow.astype(np.float32)
             else:
                 valid[obj_mask] = 0
         return flow, classes, valid, ego1_SE3_ego0
@@ -113,7 +123,7 @@ def compute_sceneflow(dataset: AV2SensorDataLoader, log_id: str,
             'pose_0': poses[0], 'pose_1': poses[1],
             'ego_motion': ego_motion}
 
-def process_log(dataset: AV2SensorDataLoader, log_id: str, output_dir: Path, n: Optional[int] = None) :
+def process_log(dataset: AV2SensorDataLoader, log_id: str, output_dir: Path, skip_pcs : bool, skip_reverse_flow : bool, n: Optional[int] = None) :
     """Outputs sceneflow and auxillary information for each pair of pointclouds in the
        dataset. Output files have the format <output_dir>/<log_id>_<sweep_1_timestamp>.npz
         Args:
@@ -128,9 +138,14 @@ def process_log(dataset: AV2SensorDataLoader, log_id: str, output_dir: Path, n: 
     avm = ArgoverseStaticMap.from_map_dir(log_map_dirpath, build_raster=True)
     timestamps = dataset.get_ordered_log_lidar_timestamps(log_id)
 
-    for ts0, ts1 in tqdm(zip(timestamps, timestamps[1:]), leave=False,
+    if n is not None:
+        iter_bar = tqdm(zip(timestamps, timestamps[1:]), leave=False,
                          total=len(timestamps) - 1, position=n,
-                         desc=f'Log {log_id}'):
+                         desc=f'Log {log_id}')
+    else:
+        iter_bar = zip(timestamps, timestamps[1:])
+    
+    for ts0, ts1 in iter_bar:
         flow = compute_sceneflow(dataset, log_id, (ts0, ts1))
         pcl_city_0 = flow['pose_0'].transform_point_cloud(flow['pcl_0'])
         pcl_city_1 = flow['pose_1'].transform_point_cloud(flow['pcl_1'])
@@ -142,39 +157,51 @@ def process_log(dataset: AV2SensorDataLoader, log_id: str, output_dir: Path, n: 
                                       'flow_0_1', 'flow_1_0',
                                       'valid_0', 'valid_1',
                                       'classes_0', 'classes_1']}
-        output['is_ground_0'] = is_ground_0
-        output['is_ground_1'] = is_ground_1
-        output['ego_motion'] = flow['ego_motion'].transform_matrix
+        output['is_ground_0'] = is_ground_0.astype(np.bool_)
+        output['is_ground_1'] = is_ground_1.astype(np.bool_)
+        output['ego_motion'] = flow['ego_motion'].transform_matrix.astype(np.float32)
+        output['pcl_0'] = output['pcl_0'].astype(np.float32)
+        output['pcl_1'] = output['pcl_1'].astype(np.float32)
+
+        if skip_pcs:
+            output.pop('pcl_0')
+            output.pop('pcl_1')
+        if skip_reverse_flow:
+            output.pop('flow_1_0')
 
         np.savez(output_dir / f'{log_id}_{ts0}.npz', **output)
 
-def proc(x):
-    current = current_process()
-    pos = current._identity[0]
+def proc(x, ignore_current_process=False):
+    if not ignore_current_process:
+        current=current_process()
+        pos = current._identity[0]
+    else:
+        pos = 1
     process_log(*x, n=pos)
     
-def process_logs(data_root: Path, output_dir: Path):
+def process_logs(data_dir: Path, output_dir: Path, nproc: int, skip_pcs: bool, skip_reverse_flow: bool):
     """Compute sceneflow for all logs in the dataset. Logs are processed in parallel.
        Args:
-         data_root: Argoverse 2.0 directory
+         data_dir: Argoverse 2.0 directory
          output_dir: Output directory.
     """
     
-    for split in ['train', 'val']:
-        data_dir = data_root / split
-        if not data_dir.exists():
-            print(f'{split} not found')
-            continue
-        
-        split_output_dir = output_dir / split
-        split_output_dir.mkdir(exist_ok=True, parents=True)
-        
-        dataset = AV2SensorDataLoader(data_dir=data_dir, labels_dir=data_dir)
-        logs = dataset.get_log_ids()
-        args = [(dataset, log, split_output_dir) for log in logs]
-        cpus = os.cpu_count()
-        nproc = max(1, cpus - 1) if cpus is not None else None
-        print(f'Using {nproc} processes')
+    if not data_dir.exists():
+        print(f'{data_dir} not found')
+        return
+    
+    split_output_dir = output_dir
+    split_output_dir.mkdir(exist_ok=True, parents=True)
+    
+    dataset = AV2SensorDataLoader(data_dir=data_dir, labels_dir=data_dir)
+    logs = dataset.get_log_ids()
+    args = sorted([(dataset, log, split_output_dir, skip_pcs, skip_reverse_flow) for log in logs])
+    
+    print(f'Using {nproc} processes')
+    if nproc <= 1:
+        for x in tqdm(args):
+            proc(x, ignore_current_process=True)
+    else:
         with Pool(processes=nproc) as p:
             res = list(tqdm(p.imap_unordered(proc, args), total=len(logs)))
 
@@ -183,9 +210,13 @@ if __name__ == '__main__':
                             description='Create a LiDAR sceneflow dataset from Argoveser 2.0 Sensor')
     parser.add_argument('--argo_dir', type=str, help='The top level directory contating the input dataset')
     parser.add_argument('--output_dir', type=str, help='The location to output the sceneflow files to')
+    parser.add_argument('--nproc', type=int, default=(multiprocessing.cpu_count() - 1))
+    parser.add_argument('--skip_pcs', action='store_true')
+    parser.add_argument('--skip_reverse_flow', action='store_true')
+
 
     args = parser.parse_args()
     data_root = Path(args.argo_dir)
     output_dir = Path(args.output_dir)
 
-    process_logs(data_root, output_dir)
+    process_logs(data_root, output_dir, args.nproc, args.skip_pcs, args.skip_reverse_flow)
